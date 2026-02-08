@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>URL Shortener</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --muted:#9ca3af; --accent:#22d3ee; --accent2:#a78bfa; --text:#e5e7eb; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:linear-gradient(135deg,#0f172a,#111827); color:var(--text); font-family:Inter,system-ui,Segoe UI,Arial; }
+    .container { max-width:900px; margin:40px auto; padding:0 16px; }
+    .header { display:flex; align-items:center; justify-content:space-between; margin-bottom:24px; }
+    .brand { font-weight:700; letter-spacing:0.4px; }
+    .card { background:#0b1220; border:1px solid #1f2937; border-radius:16px; box-shadow:0 10px 30px rgba(0,0,0,0.35); overflow:hidden; }
+    .card-head { padding:18px 20px; border-bottom:1px solid #1f2937; display:flex; align-items:center; gap:10px; }
+    .dot { width:10px; height:10px; border-radius:50%; background:var(--accent); box-shadow:0 0 12px var(--accent); }
+    .content { padding:22px; display:grid; grid-template-columns:1fr; gap:18px; }
+    @media(min-width:820px){ .content{ grid-template-columns: 1.2fr 0.8fr; } }
+    .field { display:flex; flex-direction:column; gap:8px; }
+    .label { font-size:12px; color:var(--muted); }
+    input, select, textarea { background:#0a1020; color:var(--text); border:1px solid #25304a; border-radius:10px; padding:10px 12px; outline:none; transition: border .15s, box-shadow .15s; }
+    input:focus, select:focus, textarea:focus { border-color:var(--accent); box-shadow:0 0 0 3px rgba(34,211,238,0.18); }
+    .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .actions { display:flex; gap:12px; flex-wrap:wrap; }
+    button { background:linear-gradient(135deg, var(--accent), var(--accent2)); color:#0b1220; font-weight:700; border:none; border-radius:12px; padding:10px 14px; cursor:pointer; transition: transform .08s ease; }
+    button:hover { transform: translateY(-1px); }
+    .btn-secondary { background:#131c31; color:var(--text); border:1px solid #22314f; }
+    .result { border-left:2px solid var(--accent); padding-left:14px; }
+    .result a { color:#7dd3fc; text-decoration:none; }
+    .result a:hover { text-decoration:underline; }
+    .qr { margin-top:12px; display:flex; align-items:center; gap:10px; }
+    .muted { color:var(--muted); font-size:12px; }
+    .toast { position:fixed; right:16px; bottom:16px; background:#0a1020; border:1px solid #22314f; color:var(--text); padding:10px 14px; border-radius:10px; box-shadow:0 8px 24px rgba(0,0,0,0.35); display:none; }
+    .loading { display:none; align-items:center; gap:8px; color:var(--muted); }
+    .spinner { width:16px; height:16px; border:3px solid #1f2937; border-top-color:var(--accent); border-radius:50%; animation: spin 0.9s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="brand">URL Shortener</div>
+      <div class="muted">FastAPI + DynamoDB + S3</div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><div class="dot"></div><div>Shorten your link</div></div>
+      <div class="content">
+        <div>
+          <div class="field">
+            <div class="label">Destination URL</div>
+            <input id="urlInput" type="text" placeholder="https://example.com/">
+          </div>
+          <div class="row">
+            <div class="field">
+              <div class="label">Custom code (optional)</div>
+              <input id="customCode" type="text" placeholder="">
+            </div>
+            <div class="field">
+              <div class="label">Expiration</div>
+              <select id="ttlSelect">
+                <option value="86400">1 day</option>
+                <option value="604800">7 days</option>
+                <option value="2592000">30 days</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <div class="label">Tags (comma‑separated, optional)</div>
+            <input id="tagsInput" type="text" placeholder="school, demo">
+          </div>
+          <div class="actions">
+            <button id="shortenBtn" onclick="shortenUrl()">Shorten</button>
+            <div class="loading" id="loading"><div class="spinner"></div><span>Processing…</span></div>
+          </div>
+          <div class="muted">Note: Copy buttons use Clipboard API with fallback for non‑HTTPS.</div>
+        </div>
+
+        <div>
+          <div class="result" id="result">
+            <div class="muted">Your result will appear here.</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const BASE = "http://52.4.130.156:8000"; // adjust if you move to a domain
+    const toastEl = document.getElementById("toast");
+    function showToast(msg) {
+      toastEl.textContent = msg;
+      toastEl.style.display = "block";
+      setTimeout(() => { toastEl.style.display = "none"; }, 1800);
+    }
+
+    async function shortenUrl() {
+      const url = document.getElementById("urlInput").value.trim();
+      const customCode = document.getElementById("customCode").value.trim();
+      const ttl = document.getElementById("ttlSelect").value;
+      const tags = document.getElementById("tagsInput").value.trim();
+      const loading = document.getElementById("loading");
+
+      if (!url) { showToast("Please enter a URL"); return; }
+
+      const payload = { url, ttl_seconds: Number(ttl) };
+      if (customCode) payload.custom_code = customCode;
+      if (tags) payload.tags = tags.split(",").map(t => t.trim()).filter(Boolean);
+
+      loading.style.display = "flex";
+      document.getElementById("shortenBtn").disabled = true;
+
+      try {
+        const res = await fetch(`${BASE}/api/shorten`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await res.text();
+
+        if (!res.ok) {
+          let msg;
+          try {
+            const errJson = JSON.parse(text);
+            msg = errJson.detail || text;
+          } catch {
+            msg = text || `Server error ${res.status}`;
+          }
+          throw new Error(msg);
+        }
+
+        const data = JSON.parse(text);
+
+        const code = data.code;
+        const shortLink = `${BASE}/u/${code}`;
+        const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(shortLink)}&size=160x160`;
+
+        document.getElementById("result").innerHTML = `
+          <div style="margin-bottom:10px">
+            <div class="muted">Short code</div>
+            <div>
+              <a href="${shortLink}" target="_blank">${code}</a>
+              <button class="btn-secondary" onclick="copyText('${code}')">Copy code</button>
+            </div>
+          </div>
+
+          <div style="margin-bottom:10px">
+            <div class="muted">Redirect link</div>
+            <div>
+              <a href="${shortLink}" target="_blank">${shortLink}</a>
+              <button class="btn-secondary" onclick="copyText('${shortLink}')">Copy link</button>
+            </div>
+          </div>
+
+          <div class="qr">
+            <img id="qrImage" src="${qrSrc}" alt="QR Code" width="160" height="160">
+            <button class="btn-secondary" onclick="downloadQR()">Download QR</button>
+          </div>
+
+          <div class="actions" style="margin-top:12px">
+            <button class="btn-secondary" onclick="viewStats('${code}')">View stats</button>
+            <button class="btn-secondary" onclick="openPreview('${code}')">Open preview</button>
+          </div>
+        `;
+        showToast("Short link created");
+
+      } catch (err) {
+        if (err.message.includes("Custom code already in use")) {
+          showToast("That custom code is taken. Try another.");
+        } else {
+          showToast(err.message || "Request failed");
+        }
+      } finally {
+        loading.style.display = "none";
+        document.getElementById("shortenBtn").disabled = false;
+      }
+    }
+
+    function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text).then(() => showToast("Copied"));
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+        showToast("Copied (fallback)");
+      }
+    }
+
+    async function downloadQR() {
+      const qrImg = document.querySelector("#qrImage");
+      const resp = await fetch(qrImg.src);
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = "qr.png";
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      showToast("QR downloaded");
+    }
+
+    async function viewStats(code) {
+      // Will work after we add /api/stats/{code} in Step 2
+      try {
+        const res = await fetch(`${BASE}/api/stats/${code}`);
+        if (!res.ok) throw new Error(`Stats error ${res.status}`);
+        const s = await res.json();
+        alert(`Code: ${s.code}\nURL: ${s.url}\nClicks: ${s.clicks}\nExpires: ${s.expires_at}`);
+      } catch (e) { showToast(e.message); }
+    }
+
+    function openPreview(code) {
+      // Will work after we add /preview/{code} in Step 5
+      window.open(`${BASE}/preview/${code}`, "_blank");
+    }
+  </script>
+</body>
+</html>

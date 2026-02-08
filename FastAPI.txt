@@ -1,0 +1,212 @@
+import os
+import time
+import string
+import random
+from datetime import datetime, timezone
+from typing import Optional, List
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import RedirectResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, HttpUrl
+from dotenv import load_dotenv
+import boto3
+
+# =====================
+# Models
+# =====================
+
+class ShortenRequest(BaseModel):
+    url: HttpUrl
+    ttl_seconds: Optional[int] = None
+    custom_code: Optional[str] = None
+    tags: Optional[List[str]] = None
+
+# =====================
+# Env + AWS Setup
+# =====================
+
+load_dotenv()
+
+TABLE_NAME = os.getenv("TABLE_NAME", "url-shortner")
+BASE_REDIRECT = os.getenv("BASE_REDIRECT", "http://52.4.130.156:8000")
+DEFAULT_TTL_SECONDS = int(os.getenv("DEFAULT_TTL_SECONDS", "86400"))  # 24 hours
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+dynamo = boto3.resource("dynamodb", region_name=AWS_REGION)
+table = dynamo.Table(TABLE_NAME)
+
+# =====================
+# FastAPI App
+# =====================
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# =====================
+# Helpers
+# =====================
+
+def generate_code():
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=6))
+
+def ts_to_str(ts: int) -> str:
+    """
+    Convert UNIX timestamp -> 'YYYY-MM-DD HH:MM:SS UTC'
+    """
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+# =====================
+# Routes
+# =====================
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/api/shorten")
+def shorten(req: ShortenRequest):
+    # TTL in seconds (fallback to default)
+    ttl = req.ttl_seconds or DEFAULT_TTL_SECONDS
+    now = int(time.time())
+    expires_at = now + ttl
+
+    created_at_hr = ts_to_str(now)
+    expires_at_hr = ts_to_str(expires_at)
+
+    # Use custom code if provided, else generate random
+    code = req.custom_code if req.custom_code else generate_code()
+
+    # Check if custom code already exists
+    if req.custom_code:
+        existing = table.get_item(Key={"code": code})
+        if "Item" in existing:
+            raise HTTPException(status_code=400, detail="Custom code already in use")
+
+    item = {
+        "code": code,
+        "url": str(req.url),
+        "created_at": now,              # raw timestamp (seconds)
+        "expires_at": expires_at,       # raw timestamp (seconds)
+        "created_at_hr": created_at_hr, # human readable
+        "expires_at_hr": expires_at_hr, # human readable
+    }
+
+    # Add tags if provided
+    if req.tags:
+        item["tags"] = req.tags
+
+    table.put_item(Item=item)
+
+    return {
+        "code": code,
+        "url": str(req.url),
+        "created_at": now,
+        "expires_at": expires_at,
+        "created_at_hr": created_at_hr,
+        "expires_at_hr": expires_at_hr,
+        "ttl_seconds": ttl,
+        "ttl_hours": round(ttl / 3600, 2),
+    }
+
+
+@app.get("/u/{code}")
+def redirect(code: str):
+    resp = table.get_item(Key={"code": code})
+    item = resp.get("Item")
+    if not item:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    now = int(time.time())
+    if item.get("expires_at", 0) <= now:
+        raise HTTPException(status_code=410, detail="Link expired")
+
+    # Increment clicks counter
+    table.update_item(
+        Key={"code": code},
+        UpdateExpression="SET clicks = if_not_exists(clicks, :zero) + :one",
+        ExpressionAttributeValues={":zero": 0, ":one": 1}
+    )
+
+    return RedirectResponse(url=item["url"])
+
+
+@app.get("/api/stats/{code}")
+def stats(code: str):
+    resp = table.get_item(Key={"code": code})
+    item = resp.get("Item")
+    if not item:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    # In case old items don’t have *_hr stored, compute on the fly
+    created_at = item.get("created_at")
+    expires_at = item.get("expires_at")
+
+    created_at_hr = item.get("created_at_hr")
+    if created_at and not created_at_hr:
+        created_at_hr = ts_to_str(created_at)
+
+    expires_at_hr = item.get("expires_at_hr")
+    if expires_at and not expires_at_hr:
+        expires_at_hr = ts_to_str(expires_at)
+
+    return {
+        "code": item["code"],
+        "url": item["url"],
+        "clicks": item.get("clicks", 0),
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "created_at_hr": created_at_hr,
+        "expires_at_hr": expires_at_hr,
+        "tags": item.get("tags", []),
+    }
+
+
+@app.get("/preview/{code}", response_class=HTMLResponse)
+def preview(code: str):
+    resp = table.get_item(Key={"code": code})
+    item = resp.get("Item")
+    if not item:
+        raise HTTPException(status_code=404, detail="Link not found")
+
+    now = int(time.time())
+    if item.get("expires_at", 0) <= now:
+        raise HTTPException(status_code=410, detail="Link expired")
+
+    created_at_hr = item.get("created_at_hr") or ts_to_str(item["created_at"])
+    expires_at_hr = item.get("expires_at_hr") or ts_to_str(item["expires_at"])
+
+    # Render a simple preview page
+    html_content = f"""
+    <html>
+      <head>
+        <title>Preview Link</title>
+        <style>
+          body {{ font-family: Arial, sans-serif; background:#0f172a; color:#e5e7eb; text-align:center; padding:40px; }}
+          .card {{ background:#111827; padding:20px; border-radius:12px; display:inline-block; min-width:320px; }}
+          a.button {{ display:inline-block; margin-top:20px; padding:10px 16px; background:#22d3ee; color:#0f172a; font-weight:bold; border-radius:8px; text-decoration:none; }}
+          .meta {{ font-size: 0.9rem; color:#9ca3af; margin-top:10px; }}
+        </style>
+      </head>
+      <body>
+        <div class="card">
+          <h2>Preview</h2>
+          <p>You are about to visit:</p>
+          <p><strong>{item["url"]}</strong></p>
+          <div class="meta">
+            <p>Created at: {created_at_hr}</p>
+            <p>Expires at: {expires_at_hr}</p>
+          </div>
+          <a class="button" href="{item["url"]}" target="_blank">Continue</a>
+        </div>
+      </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
